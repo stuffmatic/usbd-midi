@@ -10,7 +10,10 @@ use core::{alloc::Layout, cell::RefCell};
 use alloc_cortex_m::CortexMHeap;
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
-use hal::{gpio::{Input, PullDown, gpioa::PA0}, pac};
+use hal::{
+    gpio::{gpioa::PA0, gpioe::PE12, Input, Output, PullDown, PushPull},
+    pac,
+};
 use pac::interrupt;
 
 use hal::{
@@ -36,10 +39,13 @@ use usbd_midi::{
 };
 
 lazy_static! {
-    static ref MUTEX_BUTTON_PIN: Mutex<RefCell<Option<PA0<Input<PullDown>>>>> = Mutex::new(RefCell::new(None));
+    static ref MUTEX_BUTTON_PIN: Mutex<RefCell<Option<PA0<Input<PullDown>>>>> =
+        Mutex::new(RefCell::new(None));
     static ref MUTEX_EXTI: Mutex<RefCell<Option<pac::EXTI>>> = Mutex::new(RefCell::new(None));
-    static ref FIFO_PRODUCER: Mutex<RefCell<Option<Producer<Message>>>> = Mutex::new(RefCell::new(None));
-    static ref FIFO_CONSUMER: Mutex<RefCell<Option<Consumer<Message>>>> = Mutex::new(RefCell::new(None));
+    static ref FIFO_PRODUCER: Mutex<RefCell<Option<Producer<Message>>>> =
+        Mutex::new(RefCell::new(None));
+    static ref FIFO_CONSUMER: Mutex<RefCell<Option<Consumer<Message>>>> =
+        Mutex::new(RefCell::new(None));
 }
 
 #[global_allocator]
@@ -52,22 +58,25 @@ fn oom(_: Layout) -> ! {
 
 #[interrupt]
 fn EXTI0() {
+    // Clear the EXTI line 0 pending bit
     cortex_m::interrupt::free(|cs| {
-        let exti = MUTEX_EXTI.borrow(cs).borrow(); // acquire Mutex
+        let exti = MUTEX_EXTI.borrow(cs).borrow();
         exti.as_ref()
             .unwrap() // unwrap RefCell
             .pr1
-            .modify(|_, w| w.pr0().set_bit()); // clear the EXTI line 0 pending bit
+            .modify(|_, w| w.pr0().set_bit());
     });
 
+    // Read button state
     let button_state = cortex_m::interrupt::free(|cs| {
         let pin = MUTEX_BUTTON_PIN.borrow(cs).borrow(); // acquire Mutex
-        pin
-            .as_ref()
+        pin.as_ref()
             .unwrap() // unwrap RefCell
             .is_high()
             .unwrap()
     });
+
+    // Create a midi message to send based on the button state
     let message = if button_state {
         Message::NoteOn(
             usbd_midi::data::midi::channel::Channel::Channel1,
@@ -82,10 +91,33 @@ fn EXTI0() {
         )
     };
 
+    // Add the message to the event queue read from main
     cortex_m::interrupt::free(|cs| {
         let mut producer = FIFO_PRODUCER.borrow(cs).borrow_mut();
         let p = producer.as_mut().unwrap();
         let _ = p.push(message);
+    });
+}
+
+fn process_midi_from_interrupt(
+    midi: &mut MidiClass<UsbBus<Peripheral>>,
+    led: &mut PE12<Output<PushPull>>,
+) {
+    cortex_m::interrupt::free(|cs| {
+        let mut c = FIFO_CONSUMER.borrow(cs).borrow_mut();
+        let consumer = c.as_mut().unwrap();
+        while let Some(message) = consumer.pop() {
+            match message {
+                Message::NoteOn(_, _, _) => {
+                    led.set_high().unwrap();
+                }
+                _ => {
+                    led.set_low().unwrap();
+                }
+            }
+            midi.send_message(UsbMidiEventPacket::from_midi(CableNumber::Cable0, message))
+                .unwrap();
+        }
     });
 }
 
@@ -143,7 +175,9 @@ fn main() -> ! {
 
     let pa11 = gpioa.pa11;
     let pa12 = gpioa.pa12;
-    let pa0 = gpioa.pa0.into_pull_down_input(&mut gpioa.moder, &mut gpioa.pupdr);
+    let pa0 = gpioa
+        .pa0
+        .into_pull_down_input(&mut gpioa.moder, &mut gpioa.pupdr);
     let usb = Peripheral {
         usb: dp.USB,
         pin_dm: pa11.into_af14(&mut gpioa.moder, &mut gpioa.afrh),
@@ -179,26 +213,7 @@ fn main() -> ! {
     }
 
     loop {
-        cortex_m::interrupt::free(|cs| {
-            let mut c = FIFO_CONSUMER.borrow(cs).borrow_mut();
-            let consumer = c.as_mut().unwrap();
-            loop {
-                match consumer.pop() {
-                    Some(message) => {
-                        match message {
-                            Message::NoteOn(_, _, _) => {
-                                led2.set_high();
-                            }
-                            _ => {
-                                led2.set_low();
-                            }
-                        }
-                        midi.send_message(UsbMidiEventPacket::from_midi(CableNumber::Cable0, message));
-                    }
-                    _ => break,
-                }
-            }
-        });
+        process_midi_from_interrupt(&mut midi, &mut led2);
 
         if !usb_dev.poll(&mut [&mut midi]) {
             continue;
