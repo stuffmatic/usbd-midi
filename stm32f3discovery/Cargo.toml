@@ -13,6 +13,7 @@ usbd-midi = { path=".." }
 stm32-usbd = "*"
 usbd-serial = "*"
 usb-device = "*"
+alloc-cortex-m = "0.4.1"
 
 # Uncomment for the panic example.
 # panic-itm = "0.4.1"
@@ -26,6 +27,9 @@ usb-device = "*"
 [dependencies.stm32f3xx-hal]
 features = ["stm32f303xc", "rt"]
 version = "0.6.1"
+[dependencies.ringbuf]
+default-features = false
+version = "0.2.3"
 
 [dependencies.lazy_static]
 features = ["spin_no_std"]
